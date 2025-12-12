@@ -1,0 +1,658 @@
+---
+title: "gllvm_benthos"
+output: html_document
+date: "2025-12-11"
+---
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+{
+  
+  library(dplyr)
+  
+  library(INLA)
+  
+  library(gllvm)
+  
+  library(RANN)
+  
+  library(lattice)
+  
+  library(ggplot2)
+  
+  library(data.table)
+  
+  library(fmesher)
+  
+  library(tidyr)
+  
+  library(cowplot)
+  
+  library(RColorBrewer)
+  
+  library(viridis)
+  
+  library(ggpubr)
+  
+  library(MASS)
+  
+  library(fields) 
+  
+  library(pscl)
+  
+  library(sp)
+  
+  library(stringr)
+  
+  library(mgcv)
+
+  library(corrplot)
+  
+  library(sf)
+ 
+}
+
+```
+
+# Load Benthos data
+
+```{r}
+# Read your data
+sub_benthos <- fread("~/Project 1/Data Model/sub_benthos_updated.csv")
+
+# ensure counts are numeric
+sub_benthos$count <- as.numeric(sub_benthos$count)
+```
+
+# Filter the data for the Zand uit Zee survey
+We only want to run the model, and later the predictions for species that are also present at the extration sites
+```{r}
+ZanduitZee <- sub_benthos %>% 
+  filter(dataset_name == "ZanduitZee")
+```
+
+```{r}
+# ignoring all entries where we only got the genus
+ZanduitZee <- ZanduitZee[
+  sapply(strsplit(ZanduitZee$species, " "), length) == 2, ]
+
+# to make sure the species are well represented 
+species_sandpit <- ZanduitZee %>%
+  filter(count > 0) %>%                       
+  group_by(species) %>%
+  summarise(n_locations = n_distinct(location)) %>%
+  filter(n_locations >= 30)  # species should occur at least at 30 different sites (out of 166) can still be changed 
+
+# giving us 42 different species; species from the first project are present. So we can compare the model outputs later.
+# (Abra alba, Spisula subtruncata, Ophiura ophiura, Lanice conchilega, Echinocardium cordatum)
+```
+
+```{r}
+# filtering the benthos data set based on those 42 species
+# filtering the data also by year, year 2010 gives us data for 13 years, less years allows for a faster model run
+# with 13 years the model runs several hours (I had let it run overnight). For test run code, suggestion to reduce the number of years
+sub_benthos_filtered <- sub_benthos %>%
+  filter(species %in% species_sandpit$species)%>% 
+  filter(year > 2010)
+
+unique(sub_benthos_filtered$species) # and only the 42 species are remining 
+```
+
+# harmonize the different gears
+```{r}
+table(sub_benthos_filtered$gear)
+
+sub_benthos_filtered$gear <- ifelse(sub_benthos_filtered$gear %in% c("MONS_EBB_MZB_Boxcorer", "MWTL_MZB_Boxcorer", "MONEOS_WS_MON", "ZuZ_Chronoseq_Boxcorer", "MWTL_MZB_Hamon", "Boxcorer"),"boxcore", sub_benthos_filtered$gear)
+
+sub_benthos_filtered$gear <- ifelse(sub_benthos_filtered$gear %in% c("Bodemschaaf","bottom dredge" ),"WMR dredge", sub_benthos_filtered$gear)
+sub_benthos_filtered$gear <- ifelse(sub_benthos_filtered$gear %in% c("dredge","MWTL_MZB_Schaaf"),"NIOZ triple D", sub_benthos_filtered$gear)
+sub_benthos_filtered$gear <- ifelse(sub_benthos_filtered$gear %in% c("Zuigkor"),"dredge", sub_benthos_filtered$gear)
+
+sub_benthos_filtered <- subset(sub_benthos_filtered, 
+                            gear != "Oesterhapper" &
+                            gear  != "KIER_DELTA_2021" &
+                            gear != "WOZEP_PAWP_T15" &
+                            gear  != "onbekend" &
+                            gear != "Van Veenhapper")
+
+table(sub_benthos_filtered$gear)
+```
+
+# Change coordinate system of the benthos data into UTM31N
+```{r env}
+UTM31U <- CRS("+init=epsg:32631") 
+wgs84_crs <- CRS("+init=epsg:4326")
+
+coord_e <- st_as_sf(sub_benthos_filtered, coords = c("lon", "lat"), crs = wgs84_crs)
+
+coords_e <- st_transform(coord_e, UTM31U)
+sub_benthos_filtered <- cbind(coords_e, st_coordinates(coords_e))
+
+sub_benthos_filtered$geometry <- NULL
+```
+# Load the Environmental variables
+```{r}
+#** Bed Shear Stress ----
+shear_stress_UTM <- readRDS("~/Project 1/Data Model/shear_stress_UTM.rds")
+
+#** BPI ----
+bpi_UTM <- readRDS("~/Project 1/Data Model/bpi_UTM_all.rds")
+
+# mud
+mud_UTM <- readRDS("~/Project 1/Data Model/mud_model.rds")
+```
+
+## Add covariates to species set
+```{r asign}
+#' add BPI  
+closest_bpi <- nn2(bpi_UTM[,c("X","Y")], sub_benthos_filtered[,c("X","Y")], k = 1, searchtype = "radius", radius = 5000)
+closest_bpi$nn.idx[closest_bpi$nn.idx==0] <- NA
+sub_benthos_filtered$bpi20 <- st_drop_geometry(bpi_UTM[closest_bpi$nn.idx,"bpi20"])
+sub_benthos_filtered$bpi20<- round(sub_benthos_filtered$bpi20, 2)
+
+#' bottom shear stress
+closest <- nn2(shear_stress_UTM[,c("X", "Y")], sub_benthos_filtered[,c("X","Y")], k = 1, searchtype = "radius", radius = 5000)
+closest$nn.idx[closest$nn.idx==0]<-NA
+sub_benthos_filtered$shear_stress <- st_drop_geometry(shear_stress_UTM[closest$nn.idx,]$stress)
+sub_benthos_filtered$shear_stress <- round(sub_benthos_filtered$shear_stress, 1)
+
+#'mud
+closest <- nn2(mud_UTM[,c("X", "Y")], sub_benthos_filtered[,c("X","Y")], k = 1, searchtype = "radius", radius = 5000)
+closest$nn.idx[closest$nn.idx==0]<-NA
+sub_benthos_filtered$mud <- st_drop_geometry(mud_UTM[closest$nn.idx,]$prediction)
+sub_benthos_filtered$mud <- round(sub_benthos_filtered$mud, 2)
+
+```
+
+```{r data_loss_env_vars}
+# making sure to keep only locations with both benthos and environmental variables
+nrow(sub_benthos_filtered)
+nrow(sub_benthos_filtered[!(is.na(sub_benthos_filtered$bpi20)|is.na(sub_benthos_filtered$shear_stress)|is.na(sub_benthos_filtered$mud)),])
+
+ggplot(sub_benthos_filtered, aes(x = X, y = Y, color = factor(!(is.na(sub_benthos_filtered$bpi20)|is.na(sub_benthos_filtered$shear_stress)|is.na(sub_benthos_filtered$mud))))) +
+     geom_point() +
+     scale_color_manual(values = c("blue", "red"), labels = c("Missing Values", "No Missing Values")) +
+     labs(title = "Points with Missing Values vs No Missing Values", x = "Latitude", y = "Longitude", color = "Legend")
+
+sub_benthos_filtered <- sub_benthos_filtered[!(is.na(sub_benthos_filtered$bpi20)|is.na(sub_benthos_filtered$shear_stress)|is.na(sub_benthos_filtered$mud)),]
+```
+
+# Replace outliers
+```{r outlier}
+cols_to_adjust <- c("bpi20", "mud", "shear_stress")
+summary(sub_benthos_filtered[cols_to_adjust])
+
+# Define a function to replace outliers with quantile values
+replace_outliers <- function(x) {
+  lower_bound <- quantile(x, 0.01, na.rm = TRUE)
+  upper_bound <- quantile(x, 0.99, na.rm = TRUE)
+  x[x < lower_bound] <- lower_bound
+  x[x > upper_bound] <- upper_bound
+  return(x)
+}
+```
+
+# prediction data set
+Before creating polynomial terms, we must combine the benthos data and the prediction data into one dataset. This is necessary because:
+
+1) The prediction dataset must contain the same environmental variables
+(e.g., bpi_1, bpi_2, etc.) as the benthos dataset. Otherwise, the model cannot make predictions.
+
+2) Polynomials must be created on the combined dataset, not separately.
+If we create poly() separately for each dataset, they are calculated using different value ranges.
+This results in different polynomial scaling and leads to predictions errors.
+```{r add prediciton grid}
+grid <- readRDS("~/Project 1/Data Model/mud_pred_pit.rds") # Prediction sand pit sites
+
+grid <-grid[,c("X" ,"Y","depth","bpi20","stress","site", "prediction")]
+
+colnames(grid)[colnames(grid) == "stress"] <- "shear_stress"
+colnames(grid)[colnames(grid) == "prediction"] <- "mud"
+```
+
+```{r}
+# filter for only the environmental variables of the benthos data set
+# as grid as less columns
+env <- sub_benthos_filtered[,c("bpi20","shear_stress","mud")]
+env$id <- "train" # introduced to separate the two environments later
+env$site <- "none"
+
+env_pred <- grid[,c("bpi20","shear_stress","mud", "site")]
+env_pred$id <- "pred" # introduced to separate the two environments later
+
+# combine
+env_total <- rbind(env, env_pred)
+```
+
+# creating polynomials
+```{r smooth}
+bpi_poly<-poly(env_total$bpi20,4, raw = FALSE)
+colnames(bpi_poly)<-paste("bpi_",1:4,sep="")
+env_total<-cbind(env_total,bpi_poly)
+N<-nrow(env_total)
+
+mud_poly<-poly(env_total$mud,4, raw = FALSE)
+colnames(mud_poly)<-paste("mud_",1:4,sep="")
+env_total<-cbind(env_total,mud_poly)
+N<-nrow(env_total)
+
+stress_poly<-poly(env_total$shear_stress,4, raw = FALSE)
+colnames(stress_poly)<-paste("stress_",1:4,sep="")
+env_total<-cbind(env_total,stress_poly)
+N<-nrow(env_total)
+
+```
+
+```{r}
+env_pred  <- env_total[env_total$id == "pred", ]
+env_benthos  <- env_total[env_total$id == "train", ]
+
+env_benthos <- env_benthos[,c("bpi_1","bpi_2","bpi_3","bpi_4","mud_1","mud_2","mud_3","mud_4", "stress_1","stress_2","stress_3","stress_4")]
+```
+
+# add polynomials to benthos data
+
+```{r}
+sub_benthos_filtered <- cbind(sub_benthos_filtered, env_benthos)
+```
+
+# create factors
+```{r}
+sub_benthos_filtered <- within (sub_benthos_filtered,{
+                      lsurfacearea <- log(surfacearea)
+                      fYear <- factor(year)
+                      fGear <- factor(gear, levels=c("boxcore", "WMR dredge", "NIOZ triple D","dredge"))
+                      })
+```
+
+# changing data format
+
+The gllvm package requires data in a site × species matrix format:
+
+Each row represents one sampling location (or site).
+Each column represents one species.The values in the matrix are the species counts.
+```{r}
+sub_benthos_wide <- sub_benthos_filtered %>%
+    group_by(dataset_name, X,Y, fYear, fGear, lsurfacearea, species, bpi20, mud, shear_stress,bpi_1, bpi_2,bpi_3,bpi_4, stress_1,stress_2,stress_3,stress_4, mud_1,mud_2,mud_3,mud_4) %>%
+    summarise(count = sum(count), .groups = "drop") %>%
+    pivot_wider(
+        names_from = species,
+        values_from = count,
+        values_fill = list(count = 0)
+    )
+```
+
+# preparing for gllvm model
+
+The GLLVM model requires two separate inputs: 
+1) a species abundance matrix with one column per species and one row per site
+2) a corresponding environmental dataset containing environmental predictors for the same sites
+```{r}
+species_cols <- setdiff( # includes all the columns that are not species
+  colnames(sub_benthos_wide),
+  c("lon", "lat","X","Y", "unique_ID", "fGear","lsurfacearea", "location", "dataset_name", "fYear", "mud", "shear_stress", "bpi20","bpi_1", "bpi_2","bpi_3","bpi_4", "stress_1","stress_2","stress_3","stress_4", "mud_1","mud_2","mud_3","mud_4")
+)
+
+Yspecies <- sub_benthos_wide %>%
+  dplyr::select(all_of(species_cols)) %>%
+  as.matrix()
+
+Xenv <- sub_benthos_wide %>%
+  dplyr::select(fGear, fYear, mud, shear_stress, bpi20,bpi_1, bpi_2,bpi_3,bpi_4, stress_1,stress_2,stress_3,stress_4, mud_1,mud_2,mud_3,mud_4)
+
+# our offset
+lsurfacearea <- sub_benthos_wide$lsurfacearea
+```
+
+# creating spatial dependency
+
+The spatial GLLVM requires two ingredients:
+1) A site ID for each unique sampling location
+2) A distance (or coordinates) matrix describing the spatial relationships between sites
+
+The latent variables in a spatial GLLVM are allowed to be spatially correlated.
+This means the model can capture spatial structure in community composition
+that is not explained by the environmental covariates.
+
+However, so far I did not manage to make this work. It always ended in R studio crash as it took up too much memory.
+I suspect: 
+- issue with repeated sample locations
+- issue with the amount of locations
+
+Paper to read: https://doi.org/10.1111/biom.13416
+```{r}
+# Create site ID based on X and Y coordinates
+# sub_benthos_wide$siteID <- seq_len(nrow(sub_benthos_wide))
+
+# sub_benthos_wide <- within(sub_benthos_wide,{
+#                                 fsiteID <- factor(siteID)
+#                       })
+# 
+# site <- factor(sub_benthos_wide$siteID)
+# coords <- cbind(sub_benthos_wide$X, sub_benthos_wide$Y)
+# rownames(coords) <- levels(site)
+
+# Spatial GLLVMs use a correlation structure based on distances between sites.
+# dist() computes Euclidean distances between all pairs of sites.
+
+# site_dist <- as.matrix(dist(coords))
+```
+
+# defining the study design
+studyDesign argument is used to specify the experimental or observational structure of the data, particularly when there are random effects or repeated measures.
+
+It can be used as:
+
+- Grouping factors for random effects:
+  tells the model which variables define the grouping of sites or samples, e.g. if you have repeated sampling in different years (fYear)
+
+- Controlling for hierarchical structure
+  Sites sampled in the same year may be more similar to each other than to other years
+
+```{r}
+sub_benthos_wide$siteID <- interaction(sub_benthos_wide$X, sub_benthos_wide$Y, drop = TRUE)
+
+# Convert siteID to consecutive numeric IDs (1, 2, 3, ...)
+sub_benthos_wide$site <- as.numeric(factor(sub_benthos_wide$siteID))
+
+studyDesign = data.frame(fgear = factor(sub_benthos_wide$fGear),
+                         fyear = factor(sub_benthos_wide$fYear),
+                         site  = factor(sub_benthos_wide$site)
+                         )
+```
+
+# model
+Warnings about zeros in the species data set are expected ()
+```{r}
+model_1 <- gllvm(
+  y = Yspecies,
+  X = Xenv,
+  formula = ~ fGear,
+  studyDesign = studyDesign, 
+  row.eff = ~ corAR1(1|fyear), # works well with multiple years (e.g. 13 years), with fewer years fYear in the model formula
+  offset = lsurfacearea,
+  starting.val = "res",  #starting values can be generated by fitting model without latent variables, 
+                         # and applying factorial analysis to residuals to get starting values
+                         # for latent variables and their coefficients (starting.val = "res"). This approach is default and recommended
+  family = "negative.binomial",
+  method = "VA"         # model can be fitted using Laplace approximation method (method = "LA") or 
+                        # variational approximation method (method = "VA"), or with extended variational
+                        # approximation method (method = "EVA") when VA is not applicable. If particular model has not been implemented using the selected method, model is fitted
+                        # using the alternative method as a default. Defaults to "VA".
+  
+                        # predictLVs.gllvm only works with VA models. Current limitation of gllvm
+)
+
+model_2 <- gllvm(
+  y = Yspecies,
+  X = Xenv,
+  formula = ~ fGear,
+  offset = lsurfacearea,
+  studyDesign = studyDesign,
+  row.eff = ~ (1|site) + corAR1(1|fyear),
+   starting.val = "res",
+  family = "negative.binomial",
+   method = "VA"
+)
+```
+
+```{r}
+AIC(model_1)
+AIC(model_2)
+```
+
+# adding enviornmanetal variables
+
+```{r}
+model_3 <- gllvm(
+  y = Yspecies,
+  X = Xenv,
+  formula = ~ fGear + bpi20 + shear_stress + mud,
+  offset = lsurfacearea,
+  studyDesign = studyDesign, 
+  row.eff = ~ corAR1(1|fyear),
+  starting.val = "res",
+  family = "negative.binomial",
+   method = "LA"
+) 
+
+model_4 <- gllvm(
+  y = Yspecies,
+  X = Xenv,
+  formula = ~ fGear + bpi_1+ bpi_2 +bpi_3 + bpi_4 + stress_1+ stress_2+ stress_3+ stress_4 + mud_1+ mud_2+ mud_3+ mud_4,
+  offset = lsurfacearea,
+  studyDesign = studyDesign, 
+  row.eff = ~ corAR1(1|fyear),
+  starting.val = "res",
+  family = "negative.binomial",
+   method = "LA"
+) 
+```
+
+```{r}
+AIC(model_3) 
+AIC(model_4)
+```
+
+# Species -species assocations
+```{r}
+library(corrplot); library(gclus)
+
+cr <- getResidualCor(model_4)
+corrplot(cr[order.single(cr), order.single(cr)], diag = FALSE, type = "lower", 
+         method = "square", tl.cex = 0.5, tl.srt = 45, tl.col = "red")
+```
+
+```{r}
+summary(model_4)
+```
+
+```{r}
+# Graphical visualization of model coefficients
+coefplot(model_4, cex.ylab = 0.7, mar = c(4, 9, 2, 1), mfrow=c(1,1))
+
+# Compute confidence intervals for the environmental coefficients.
+confint(model_4, level = 0.95, parm = "Xcoef")
+```
+
+```{r}
+# Generic plotting function for a GLLVM object
+# It shows:
+# residual diagnostics
+# Latent variable plots
+
+plot(model_4, mfrow = c(3,2))
+```
+
+```{r}
+# Ordination (biplot) of species and sites in the latent variable space.
+ordiplot(model_4, biplot = TRUE, ind.spp = 18, xlim = c(-3, 3), ylim = c(-3, 3), 
+         main = "Biplot")
+```
+
+```{r}
+# Computes variance partitioning for the model
+# Separates the proportion of variance explained by:
+# - Environmental predictors (X)
+# - Latent variables
+# - Residual unexplained variance
+
+VP1 <- VP(model_4)
+plot(VP1, args.legend = list(cex=0.5), col=hcl.colors(16, "Roma"))
+```
+
+```{r}
+# examining AR1 temporal random effects
+model_Pit4$params$sigma
+
+rowYear <- model_Pit4$params$row.params
+predErr <- getPredictErr(model_Pit4)
+seYear  <- predErr$row.effects[[1]]   # only one group
+years <- as.numeric(levels(studyDesign$fyear))
+plot(years, rowYear,
+     ylim = range(rowYear) + c(-1.96,1.96)*max(abs(seYear)),
+     main = "Random effect: year",
+     xlab = "Year", ylab = "Random effect")
+
+lines(years, rowYear - 1.96*seYear, col = 2)
+lines(years, rowYear + 1.96*seYear, col = 2)
+```
+
+```{r}
+# # species optima -> only if the latent variables are quadratic, so far I did not fully understood this yet
+# But in theory it should allow:
+# with quadratic latent variables, species responses along the latent gradients can be characterized in terms of optima and tolerances. The optima() function  
+# estimates the position along each latent variable where a species is expected to reach its highest abundance, representing its preferred ecological niche. The 
+# tolerances() function quantifies the niche breadth, indicating whether a species is specialized (narrow tolerance) or 
+# generalist (wide tolerance) along the gradient.
+# ## S3 method for class 'gllvm'
+# optima(model_Pit4, sd.errors = TRUE, ...)
+# ## S3 method for class 'gllvm'
+# tolerances(object, sd.errors = TRUE, ...)
+```
+
+# Predict abundance for sand pit areas
+```{r add prediciton grid}
+# remember the environmental dataset we already created
+head(env_pred)
+
+# we do not need "id" anymore, identify as new Environment 
+Xnew <- env_pred %>%
+  dplyr::select(- id)
+```
+
+```{r}
+# we need year and gear
+new_grid <- Xnew %>%
+  mutate(fYear = NA,
+         fGear = NA)
+
+new_grid <- within (new_grid,{
+                      fYear <- factor(2023, levels = levels(Xenv$fYear))
+                      fGear <- factor("WMR dredge", levels = levels(Xenv$fGear))
+                      })
+
+# what is the mean lsurfacearea in our dataset?
+summary(sub_benthos_wide$lsurfacearea)
+newOffset <- rep(2.688, nrow(new_grid))
+```
+
+```{r}
+# run the predictions
+# adding offset is causing errors 
+# new sites can be specified in newX. If predictors newX (and newTR) are given, and newLV is not, latent
+# variables are not used in the predictions. 
+# level stands for latent variables: level =1 (latent variable are used, gives errors as different numbers of locations)
+
+x <-  predict.gllvm(model_Pit4, new_grid, offset= FALSE, level = 0)
+
+# getting the location information to be able to plot the predictions 
+location <- grid %>%
+  dplyr::select(X, Y, site)
+
+prediction <- cbind(x, location)
+```
+
+# plot prediction
+
+```{r}
+# Load packages
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(viridis)
+library(RColorBrewer)
+library(ggspatial)
+library(patchwork)
+library(ggh4x)
+
+# --------------------------
+# Select species to plot
+# --------------------------
+
+species_list <- c("Spisula subtruncata", "Abra alba", "Ophiura ophiura", "Lanice conchilega", "Echinocardium cordatum")  # Add more species if needed, for now focus on the four species of project 1 
+site_order <- c("Q16H", "Q5J", "Q5H", "M9J") # the different sand pit locations
+
+# --------------------------
+# Convert from wide to long
+# --------------------------
+
+pred_long <- prediction %>%
+    dplyr::select(all_of(species_list), X, Y, site) %>%
+    pivot_longer(
+        cols = all_of(species_list),
+        names_to = "species",
+        values_to = "prediction"
+    )
+
+# Only keep sites with data
+pred_long <- pred_long %>%
+    filter(!is.na(prediction), site %in% site_order)
+
+# Factorize for ordering
+pred_long$species <- factor(pred_long$species, levels = species_list)
+pred_long$site <- factor(pred_long$site, levels = site_order)
+
+# --------------------------
+# Color palettes per species
+# --------------------------
+
+species_palettes <- list(
+    "Spisula subtruncata"    = viridis(100),
+    "Abra alba"              = viridis(100),
+    "Ophiura ophiura"        = viridis(100),
+    "Lanice conchilega"      = viridis(100),
+    "Echinocardium cordatum" = viridis(100)
+)
+
+# --------------------------
+# Plotting function
+# --------------------------
+
+create_species_plot <- function(species_data, species_name){
+    
+    ggplot(species_data, aes(x = X, y = Y, fill = prediction)) +
+        geom_raster() +
+        scale_fill_gradientn(
+            colors = species_palettes[[species_name]],
+            name = "log(Density)",
+            guide = guide_colourbar(barwidth = 1, barheight = 5)
+        ) +
+        facet_grid2(vars(species), vars(site), scales = "free", independent = "all") +
+    theme_minimal(base_family = "Helvetica") +
+        theme(
+            axis.title = element_blank(),
+            axis.text = element_blank(),
+            axis.ticks = element_blank(),
+            strip.text.y = element_text(size = 8),
+            strip.text.x = element_text(size = 8),
+            panel.spacing = unit(1, "lines"),
+            panel.background = element_blank(),
+            panel.border = element_rect(color = "black", fill = NA, size = 1),
+            legend.position = "right",
+            legend.text = element_text(size = 8),
+            legend.title = element_text(size = 8)
+        )
+}
+
+# --------------------------
+# Generate plots per species
+# --------------------------
+
+species_plots <- lapply(species_list, function(sp){
+    sp_data <- pred_long %>% filter(species == sp)
+    create_species_plot(sp_data, sp)
+})
+
+# Combine vertically
+combined_plot <- wrap_plots(species_plots, ncol = 1)
+combined_plot
+```
+
+# predict latent variables
+```{r}
+# only for VA models
+# Obtains predictions for latent variables from a fitted generalized linear latent variable model object.
+predLVs <- predictLVs.gllvm(model_Pit4, newX = new_grid, newY = NULL)
+```
