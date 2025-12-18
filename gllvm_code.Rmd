@@ -55,11 +55,18 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ```
 
+# Define location of data
+```{r}
+# Read your data
+data_loc <- "/home/storage/benthos_data"
+```
+
+
 # Load Benthos data
 
 ```{r}
 # Read your data
-sub_benthos <- fread("~/Project 1/Data Model/sub_benthos_updated.csv")
+sub_benthos <- fread(file.path(data_loc,"sub_benthos.csv"))
 
 # ensure counts are numeric
 sub_benthos$count <- as.numeric(sub_benthos$count)
@@ -94,9 +101,9 @@ species_sandpit <- ZanduitZee %>%
 # with 13 years the model runs several hours (I had let it run overnight). For test run code, suggestion to reduce the number of years
 sub_benthos_filtered <- sub_benthos %>%
   filter(species %in% species_sandpit$species)%>% 
-  filter(year > 2010)
+  filter(year > 2022)
 
-unique(sub_benthos_filtered$species) # and only the 42 species are remining 
+unique(sub_benthos_filtered$species) # and only the 42 species are remaining 
 ```
 
 # harmonize the different gears
@@ -134,13 +141,13 @@ sub_benthos_filtered$geometry <- NULL
 # Load the Environmental variables
 ```{r}
 #** Bed Shear Stress ----
-shear_stress_UTM <- readRDS("~/Project 1/Data Model/shear_stress_UTM.rds")
+shear_stress_UTM <- readRDS(file.path(data_loc,"shear_stress_UTM.rds"))
 
 #** BPI ----
-bpi_UTM <- readRDS("~/Project 1/Data Model/bpi_UTM_all.rds")
+bpi_UTM <- readRDS(file.path(data_loc,"bpi_UTM_all.rds"))
 
 # mud
-mud_UTM <- readRDS("~/Project 1/Data Model/mud_model.rds")
+mud_UTM <- readRDS(file.path(data_loc,"mud_model.rds"))
 ```
 
 ## Add covariates to species set
@@ -203,7 +210,7 @@ Before creating polynomial terms, we must combine the benthos data and the predi
 If we create poly() separately for each dataset, they are calculated using different value ranges.
 This results in different polynomial scaling and leads to predictions errors.
 ```{r add prediciton grid}
-grid <- readRDS("~/Project 1/Data Model/mud_pred_pit.rds") # Prediction sand pit sites
+grid <- readRDS(file.path(data_loc,"mud_pred_pit.rds")) # Prediction sand pit sites
 
 grid <-grid[,c("X" ,"Y","depth","bpi20","stress","site", "prediction")]
 
@@ -257,6 +264,16 @@ env_benthos <- env_benthos[,c("bpi_1","bpi_2","bpi_3","bpi_4","mud_1","mud_2","m
 sub_benthos_filtered <- cbind(sub_benthos_filtered, env_benthos)
 ```
 
+# keep only species for which we have at least a single positive count
+```{r}
+spec_num <- aggregate(count~ species, data = sub_benthos_filtered, FUN = "sum")
+spec_to_keep <- spec_num[spec_num$count >0,"species"]
+
+sub_benthos_filtered <- sub_benthos_filtered[sub_benthos_filtered$species %in% spec_to_keep,]
+
+```
+
+
 # create factors
 ```{r}
 sub_benthos_filtered <- within (sub_benthos_filtered,{
@@ -265,6 +282,7 @@ sub_benthos_filtered <- within (sub_benthos_filtered,{
                       fGear <- factor(gear, levels=c("boxcore", "WMR dredge", "NIOZ triple D","dredge"))
                       })
 ```
+
 
 # changing data format
 
@@ -282,6 +300,8 @@ sub_benthos_wide <- sub_benthos_filtered %>%
         values_fill = list(count = 0)
     )
 ```
+
+
 
 # preparing for gllvm model
 
@@ -361,6 +381,8 @@ studyDesign = data.frame(fgear = factor(sub_benthos_wide$fGear),
                          site  = factor(sub_benthos_wide$site)
                          )
 ```
+
+
 
 # model
 Warnings about zeros in the species data set are expected ()
